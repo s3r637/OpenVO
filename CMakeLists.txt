@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.0)
+cmake_minimum_required(VERSION 3.5)
 
 set(MAJOR_VERSION 0)
 set(MINOR_VERSION 0)
@@ -8,6 +8,14 @@ project(OpenVO
 	VERSION ${MAJOR_VERSION}.${MINOR_VERSION}.${PATCH_VERSION}
 	DESCRIPTION "Visual Odometry based on OpenCV."
 	LANGUAGES CXX)
+
+find_package(Boost REQUIRED COMPONENTS
+		filesystem
+		program_options
+)
+
+find_package(OpenCV REQUIRED)
+include_directories(${OpenCV_INCLUDE_DIRS})
 
 add_subdirectory(src)
 
