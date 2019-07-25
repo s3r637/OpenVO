@@ -175,28 +175,60 @@ int main(int argc, char ** argv)
 
 	cv::namedWindow("result", cv::WINDOW_AUTOSIZE);
 
+	// create stereo matcher
+	cv::Ptr<cv::StereoBM> matcher = cv::StereoBM::create(0, 21);
+	// TODO: find out the effects of the setters and make use of it
+//	matcher->setBlockSize(0);
+//	matcher->setDisp12MaxDiff(0);
+//	matcher->setMinDisparity(0);
+//	matcher->setNumDisparities(0);
+//	matcher->setPreFilterCap(0);
+//	matcher->setPreFilterSize(0);
+//	matcher->setPreFilterType(0);
+//	matcher->setSmallerBlockSize(0);
+//	matcher->setSpeckleRange(0);
+//	matcher->setSpeckleWindowSize(0);
+//	matcher->setTextureThreshold(0);
+//	matcher->setUniquenessRatio(0);
+
 	// iterate over frames and feed them into OpenVO
 	for (int id = opts->mStart; id < opts->mEnd; id += opts->mStep) {
 		auto const & leftPath = leftFramePaths[id];
 		auto const & rightPath = rightFramePaths[id];
 
 		// load left image
-		cv::Mat leftMat = cv::imread(leftPath, cv::IMREAD_UNCHANGED);
+		cv::Mat leftMat = cv::imread(leftPath, cv::IMREAD_GRAYSCALE);
 		if (leftMat.empty()) { // is input invalid
 			std::cerr <<  "Could not open or find the left image: '" << leftPath << "'" << std::endl;
 			return EXIT_FAILURE;
 		}
 
 		// load right image
-		cv::Mat rightMat = cv::imread(rightPath, cv::IMREAD_UNCHANGED);
+		cv::Mat rightMat = cv::imread(rightPath, cv::IMREAD_GRAYSCALE);
 		if (rightMat.empty()) { // is input invalid
 			std::cerr <<  "Could not open or find the right image: '" << rightMat << "'" << std::endl;
 			return EXIT_FAILURE;
 		}
 
-		cv::Mat stereoMat = leftMat * 0.5f + rightMat * 0.5f;
-		cv::imshow("result", stereoMat);
-		auto const key = cv::waitKey(100);
+		// disparity calculation
+		cv::Mat disparity16;
+		// StereoBM compute 16-bit fixed-point disparity map (where each disparity value has 4 fractional bits).
+		matcher->compute(leftMat, rightMat, disparity16);
+		// TODO: spackle filter?
+		cv::Mat disparity32;
+		disparity16.convertTo(disparity32, CV_32F);
+		disparity32 /= 16.f;
+
+		// apply a colormap to the computed disparity for visualization only!
+		double min;
+		double max;
+		cv::minMaxIdx(disparity16, &min, &max);
+		cv::Mat result, disparityScaled;
+		disparity16.convertTo(disparityScaled, CV_8U, 255 / (max - min));
+		cv::applyColorMap(disparityScaled, result, cv::COLORMAP_JET);
+
+		cv::imshow("result", result);
+		auto const key = cv::waitKey(1);
 		if (ESC_KEY == key) { // exit when the Escape key is pressed
 			id = std::numeric_limits<int>::max() - 1;
 		}
