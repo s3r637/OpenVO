@@ -1,15 +1,21 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <fstream>
 #include <iostream>
 #include <iterator>
 #include <limits>
 #include <memory>
+#include <regex>
+#include <set>
+#include <string>
 
+#include <boost/algorithm/string.hpp>
 #include <boost/filesystem.hpp>
 #include <boost/program_options.hpp>
 
 #include <opencv2/opencv.hpp>
+#include <opencv2/video/tracking.hpp>
 
 #include "openvo/Tracker.hpp"
 
@@ -24,6 +30,13 @@ constexpr int ESC_KEY = 27;
 struct ProgramOptions
 {
 	ProgramOptions(int argc, char ** argv)
+		: mBaseDir{}
+		, mLeftFramesDir{}
+		, mRightFramesDir{}
+		, mCalibrationFile{}
+		, mStart{}
+		, mEnd{}
+		, mStep{}
 	{
 		po::options_description desc("Allowed options");
 		desc.add_options()
@@ -41,6 +54,10 @@ struct ProgramOptions
 			 po::value<fs::path>(&mRightFramesDir)->default_value("right")->implicit_value("image_1"),
 			 "folder containing depth images per frame")
 
+			("calibration,c",
+			 po::value<fs::path>(&mCalibrationFile)->default_value("calib.txt"),
+			 "calibration file")
+
 			("start",
 			 po::value<int>(&mStart)->default_value(0),
 			 "start at frame")
@@ -48,7 +65,7 @@ struct ProgramOptions
 			 po::value<int>(&mStep)->default_value(1)->implicit_value(2),
 			 "frame skipping, step size over frames")
 			("end",
-			 po::value<int>(&mEnd)->default_value(std::numeric_limits<int>::max()), // TODO: just keep it in mind
+			 po::value<int>(&mEnd)->default_value(std::numeric_limits<int>::max()), // NOTE: just keep it in mind
 			 "end at frame")
 
 			 ("verbose",
@@ -72,13 +89,17 @@ struct ProgramOptions
 		if (not mBaseDir.empty()) {
 			mLeftFramesDir = this->extend(mBaseDir, mLeftFramesDir);
 			mRightFramesDir = this->extend(mBaseDir, mRightFramesDir);
+			mCalibrationFile = this->extend(mBaseDir, mCalibrationFile);
 		}
 
 		if (not fs::is_directory(mLeftFramesDir)) {
-			throw std::invalid_argument("path given in --left does not exist");
+			throw std::invalid_argument("dir given in --left does not exist");
 		}
 		if (not fs::is_directory(mRightFramesDir)) {
-			throw std::invalid_argument("path given in --right does not exist");
+			throw std::invalid_argument("dir given in --right does not exist");
+		}
+		if (not fs::is_regular_file(mCalibrationFile)) {
+			throw std::invalid_argument("file given in --calibration does not exist");
 		}
 	}
 
@@ -89,7 +110,8 @@ struct ProgramOptions
 	 * @param child The child path.
 	 * @return root / child
 	 */
-	fs::path extend(fs::path const & root, fs::path const & child) {
+	[[nodiscard]] fs::path extend(fs::path const & root, fs::path const & child) const
+	{
 		if (child.is_relative() and not child.empty()) {
 			return root / child;
 		}
@@ -99,10 +121,24 @@ struct ProgramOptions
 	fs::path mBaseDir;
 	fs::path mLeftFramesDir;
 	fs::path mRightFramesDir;
+	fs::path mCalibrationFile;
 
 	int mStart;
 	int mStep;
 	int mEnd;
+};
+
+struct Calibration
+{
+	float_t fx;
+	float_t fy;
+
+	float_t cx;
+	float_t cy;
+
+	// tx = -fx * B
+	// B = tx / (-fx)
+	float_t tx;
 };
 
 /**
@@ -111,7 +147,8 @@ struct ProgramOptions
  * @param p File path.
  * @return True if path is hidden, otherwise false.
  */
-bool isHidden(fs::path const & p) {
+bool isHidden(fs::path const & p)
+{
 	auto const name = p.filename();
 	return name != ".." && name != "." && name.string()[0] == '.';
 }
@@ -122,12 +159,13 @@ bool isHidden(fs::path const & p) {
  * @param p File path.
  * @return True if @p p is a regular file, otherwise false.
  */
-bool isRegular(fs::path const & p) {
-	return fs::regular_file == fs::status(p).type();
+bool isRegular(fs::path const & p)
+{
+	return fs::is_regular_file(p);
 }
 
 /**
- * @brief Collects all files of @a dir.
+ * @brief Collects regular and not hidden files of @a dir.
  *
  * @param dir Directory.
  * @return A collection of file paths.
@@ -140,6 +178,79 @@ std::vector<std::string> collectFiles(fs::path const & dir) {
 		}
 	}
 	return collection;
+}
+
+/**
+ * Loads a whole file in a string.
+ *
+ * @param file File path.
+ * @return The contant of the file.
+ */
+std::string loadFileContent(fs::path const & file)
+{
+	std::ifstream t{file.string()};
+	std::string str;
+
+	t.seekg(0, std::ios::end);
+	auto const pos = t.tellg();
+	if (0 > pos) {
+		throw std::runtime_error{"Stream seek fails at the content of '" + file.string() + "'"};
+	}
+	str.reserve(static_cast<std::size_t>(pos));
+	t.seekg(0, std::ios::beg);
+
+	str.assign(std::istreambuf_iterator<char>(t), std::istreambuf_iterator<char>());
+	boost::trim(str);
+
+	return str;
+}
+/**
+ * @brief Reads all numeric values from a file and fills a vector with them.
+ *
+ * @tparam T Arithmetic type.
+ * @param file File path.
+ * @return A vector of numeric values.
+ */
+template <typename T>
+std::vector<T> loadNumerics(fs::path const & file)
+{
+	static_assert(std::is_arithmetic<T>::value, "Not an arithmetic type.");
+
+	std::vector<T> numerics;
+	std::string content = loadFileContent(file);
+	std::regex const regex{R"(\s|\n|\r|\t)"};
+	std::sregex_token_iterator it{std::begin(content), std::end(content), regex, -1};
+	std::vector<std::string> words{it, {}};
+	for (auto && w : words) {
+		try {
+			T const val = boost::lexical_cast<T>(w);
+			numerics.emplace_back(val);
+		}
+		catch (boost::bad_lexical_cast const &) {
+			std::cout << "[WARN] Caught bad lexical cast on '" << w << "'." << std::endl;
+		}
+	}
+	return numerics;
+}
+
+/**
+ * Loads (right camera) calibration.
+ *
+ * @param file File path.
+ * @return Calibration.
+ */
+Calibration loadCalibration(fs::path const & file)
+{
+	auto && numerics = loadNumerics<float_t>(file);
+
+	std::size_t const base{12L}; // skip left camera calibration
+	float_t const fx = numerics.at(base + 0);
+	float_t const cx = numerics.at(base + 2);
+	float_t const tx = numerics.at(base + 3);
+	float_t const fy = numerics.at(base + 5);
+	float_t const cy = numerics.at(base + 6);
+
+	return {fx, fy, cx, cy, tx};
 }
 
 int main(int argc, char ** argv)
@@ -161,38 +272,60 @@ int main(int argc, char ** argv)
 		return EXIT_FAILURE;
 	}
 
-	// collect left & right frames
+	//
+	// preparation
+	//
+
+	// collect left & right frame paths
 	std::vector<std::string> leftFramePaths = collectFiles(opts->mLeftFramesDir);
 	std::vector<std::string> rightFramePaths = collectFiles(opts->mRightFramesDir);
 
-	// sort both frame collections
+	// sort both path collections
 	std::sort(std::begin(leftFramePaths), std::end(leftFramePaths));
 	std::sort(std::begin(rightFramePaths), std::end(rightFramePaths));
 
 	// TODO: left & right consistency check (size & name)
 
+	// makes sure the loop ends
 	opts->mEnd = static_cast<int>(std::size(leftFramePaths));
+
+	// load the calibration of right camera
+	Calibration calib = loadCalibration(opts->mCalibrationFile);
+
+	//
+	// create stereo matcher
+	//
+
+	// 64 seems to be a good sweet spot -> depth range ~ (6m - 6000m], we will skip infinite depths
+	cv::Ptr<cv::StereoBM> stereo = cv::StereoBM::create(64, 11);
+	stereo->setPreFilterCap(49);
+	stereo->setPreFilterSize(65);
+	stereo->setSpeckleRange(51);
+	stereo->setSpeckleWindowSize(160);
+	stereo->setTextureThreshold(160);
+	stereo->setUniquenessRatio(32);
+
+	//
+	// parameterization
+	//
+
+	// Shi-Tomasi parameter
+	int const maxCorners = 1024;
+	double const qualityLevel = 0.01;
+	double const minDistance = 10;
+	int const blockSize = 3;
+	bool const useHarrisDetector = false;
+	double const k = 0.04;
 
 	cv::namedWindow("result", cv::WINDOW_AUTOSIZE);
 
-	// create stereo matcher
-	cv::Ptr<cv::StereoBM> matcher = cv::StereoBM::create(0, 21);
-	// TODO: find out the effects of the setters and make use of it
-//	matcher->setBlockSize(0);
-//	matcher->setDisp12MaxDiff(0);
-//	matcher->setMinDisparity(0);
-//	matcher->setNumDisparities(0);
-//	matcher->setPreFilterCap(0);
-//	matcher->setPreFilterSize(0);
-//	matcher->setPreFilterType(0);
-//	matcher->setSmallerBlockSize(0);
-//	matcher->setSpeckleRange(0);
-//	matcher->setSpeckleWindowSize(0);
-//	matcher->setTextureThreshold(0);
-//	matcher->setUniquenessRatio(0);
+	//
+	// Loop
+	//
 
 	// iterate over frames and feed them into OpenVO
 	for (int id = opts->mStart; id < opts->mEnd; id += opts->mStep) {
+
 		auto const & leftPath = leftFramePaths[id];
 		auto const & rightPath = rightFramePaths[id];
 
@@ -210,24 +343,59 @@ int main(int argc, char ** argv)
 			return EXIT_FAILURE;
 		}
 
-		// disparity calculation
+		//
+		// disparity & depth map calculation
+		//
+
 		cv::Mat disparity16;
 		// StereoBM compute 16-bit fixed-point disparity map (where each disparity value has 4 fractional bits).
-		matcher->compute(leftMat, rightMat, disparity16);
-		// TODO: spackle filter?
+		stereo->compute(leftMat, rightMat, disparity16);
+
 		cv::Mat disparity32;
-		disparity16.convertTo(disparity32, CV_32F);
-		disparity32 /= 16.f;
+		disparity16.convertTo(disparity32, CV_32F, 1.f / 16.f);
+
+		cv::Mat_<float_t> depthMap(disparity32.size());
+		depthMap = -calib.tx / disparity32;
+
+		//
+		// corner detection
+		//
+
+		std::vector<cv::Point2f> corners;
+		// detect corners
+		cv::goodFeaturesToTrack(leftMat, corners, maxCorners, qualityLevel, minDistance, cv::noArray(), blockSize, useHarrisDetector, k);
+
+		//
+		// visualization
+		//
 
 		// apply a colormap to the computed disparity for visualization only!
-		double min;
-		double max;
-		cv::minMaxIdx(disparity16, &min, &max);
-		cv::Mat result, disparityScaled;
-		disparity16.convertTo(disparityScaled, CV_8U, 255 / (max - min));
-		cv::applyColorMap(disparityScaled, result, cv::COLORMAP_JET);
+		cv::Mat disparityColored, disparityScaled;
+		// disparity range: [min valid/used value - max value] -> (0 - 64]
+		// 16-bit fixed-point disparity map with 4 fractional bits -> shift 4 bits or * 16
+		// alpha = 255 / (max - min) -> 0.249 = 255 / (64 * 16 - (1/16) * 16)
+		// fix alpha keeps the colors of depths stable, calculation of min - max changes alpha -> "color flickers"
+		disparity16.convertTo(disparityScaled, CV_8U, 0.249);
+		cv::applyColorMap(disparityScaled, disparityColored, cv::COLORMAP_JET);
 
-		cv::imshow("result", result);
+		cv::Mat leftColored; // not really, just 3 channels
+		cv::cvtColor(leftMat, leftColored, cv::COLOR_GRAY2BGR);
+
+		// overlay left image and disparity map
+		cv::Mat overlay = leftColored * 0.67f + disparityColored * 0.33f;
+
+		// mark invalid disparities (and zeros, skip infinite depths)
+		cv::Mat mask = (short{0} >= disparity16);
+		// copy the marked pixels from the left image into the result image
+		leftColored.copyTo(overlay, mask);
+
+		// draw all strong corners
+		for (auto && pt : corners) {
+			cv::circle(overlay, pt, 2, cv::Scalar{255, 255, 255}, -1, 8, 0);
+			cv::circle(overlay, pt, 1, cv::Scalar{0, 0, 0}, -1, 8, 0);
+		}
+
+		cv::imshow("result", overlay);
 		auto const key = cv::waitKey(1);
 		if (ESC_KEY == key) { // exit when the Escape key is pressed
 			id = std::numeric_limits<int>::max() - 1;
