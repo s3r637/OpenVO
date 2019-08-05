@@ -14,6 +14,8 @@ find_package(Boost REQUIRED COMPONENTS
 		program_options
 )
 
+find_package(Eigen3 3.3 REQUIRED NO_MODULE)
+
 find_package(OpenCV REQUIRED)
 include_directories(${OpenCV_INCLUDE_DIRS})
 

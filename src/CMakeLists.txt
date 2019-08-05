@@ -22,6 +22,7 @@ set_target_properties(ovo
 target_link_libraries(ovo PUBLIC
 	Boost::filesystem
 	Boost::program_options
+	Eigen3::Eigen
 	${OpenCV_LIBS}
 	openvo
 )
