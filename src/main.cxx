@@ -14,7 +14,11 @@
 #include <boost/filesystem.hpp>
 #include <boost/program_options.hpp>
 
+#include <Eigen/Dense>
+#include <Eigen/StdVector>
+
 #include <opencv2/opencv.hpp>
+#include <opencv2/core/eigen.hpp>
 #include <opencv2/video/tracking.hpp>
 
 #include "openvo/Tracker.hpp"
@@ -23,6 +27,7 @@ namespace fs = boost::filesystem;
 namespace po = boost::program_options;
 
 constexpr int ESC_KEY = 27;
+constexpr int ESC_SPACE = 32;
 
 /**
  * Represents the passed command-line arguments.
@@ -157,7 +162,7 @@ bool isHidden(fs::path const & p)
  * @brief Checks if given path @a p is a regular file.
  *
  * @param p File path.
- * @return True if @p p is a regular file, otherwise false.
+ * @return True if @a p is a regular file, otherwise false.
  */
 bool isRegular(fs::path const & p)
 {
@@ -253,6 +258,22 @@ Calibration loadCalibration(fs::path const & file)
 	return {fx, fy, cx, cy, tx};
 }
 
+/**
+ * Removes all elements from @a v where the value of @a b is 0.
+ * Provided for convenience.
+ *
+ * @tparam T Type of vector @a v.
+ * @param b Mask.
+ * @param v Vector.
+ */
+template<typename T>
+inline void filter(std::vector<std::uint8_t> const & b, std::vector<T> & v)
+{
+	assert(std::size(v) == std::size(b));
+	auto it = std::begin(b);
+	v.erase(std::remove_if(std::begin(v), std::end(v), [&](T) { return !static_cast<bool>(*it++); }), std::end(v));
+}
+
 int main(int argc, char ** argv)
 {
 	std::unique_ptr<ProgramOptions> opts;
@@ -293,19 +314,6 @@ int main(int argc, char ** argv)
 	Calibration calib = loadCalibration(opts->mCalibrationFile);
 
 	//
-	// create stereo matcher
-	//
-
-	// 64 seems to be a good sweet spot -> depth range ~ (6m - 6000m], we will skip infinite depths
-	cv::Ptr<cv::StereoBM> stereo = cv::StereoBM::create(64, 11);
-	stereo->setPreFilterCap(49);
-	stereo->setPreFilterSize(65);
-	stereo->setSpeckleRange(51);
-	stereo->setSpeckleWindowSize(160);
-	stereo->setTextureThreshold(160);
-	stereo->setUniquenessRatio(32);
-
-	//
 	// parameterization
 	//
 
@@ -313,33 +321,71 @@ int main(int argc, char ** argv)
 	int const maxCorners = 1024;
 	double const qualityLevel = 0.01;
 	double const minDistance = 10;
-	int const blockSize = 3;
+	int const cornerBlockSize = 3;
 	bool const useHarrisDetector = false;
 	double const k = 0.04;
 
+	// sparse iterative optical flow parameter
+	cv::Size const windowSize{31, 31};
+	int const maxLevel = 3;
+	cv::TermCriteria const termCriteria{cv::TermCriteria::COUNT | cv::TermCriteria::EPS, 30, 0.01};
+	double const minEigThreshold = 1e-4;
+
+	// stereo block matcher
+	int const numDisparities = 64; // seems to be a good sweet spot -> depth range ~ (6m - 6000m], we will skip infinite depths
+	int const stereoBlockSize = 11;
+	int const preFilterCap = 49;
+	int const preFilterSize = 65;
+	int const speckleRange = 51;
+	int const speckleWindowSize = 160;
+	int const textureThreshold = 160;
+	int const uniquenessRatio = 32;
+
+	//
+	// create stereo matcher
+	//
+
+	cv::Ptr<cv::StereoBM> stereo = cv::StereoBM::create(numDisparities, stereoBlockSize);
+	stereo->setPreFilterCap(preFilterCap);
+	stereo->setPreFilterSize(preFilterSize);
+	stereo->setSpeckleRange(speckleRange);
+	stereo->setSpeckleWindowSize(speckleWindowSize);
+	stereo->setTextureThreshold(textureThreshold);
+	stereo->setUniquenessRatio(uniquenessRatio);
+
 	cv::namedWindow("result", cv::WINDOW_AUTOSIZE);
+
+	cv::Mat prevLeftImage;
+
+	std::vector<Eigen::Affine3d, Eigen::aligned_allocator<Eigen::Affine3d>> trajectory;
+	// first frame
+	trajectory.push_back(Eigen::Affine3d::Identity());
+
+	// meter per pixel
+	float trajectoryScale = 1.f;
+	bool play = true;
 
 	//
 	// Loop
 	//
 
 	// iterate over frames and feed them into OpenVO
-	for (int id = opts->mStart; id < opts->mEnd; id += opts->mStep) {
+	for (int frameIdx = opts->mStart; frameIdx < opts->mEnd; frameIdx += opts->mStep) {
 
-		auto const & leftPath = leftFramePaths[id];
-		auto const & rightPath = rightFramePaths[id];
+		auto const & leftPath = leftFramePaths[frameIdx];
+		auto const & rightPath = rightFramePaths[frameIdx];
 
 		// load left image
-		cv::Mat leftMat = cv::imread(leftPath, cv::IMREAD_GRAYSCALE);
-		if (leftMat.empty()) { // is input invalid
+		cv::Mat leftImage = cv::imread(leftPath, cv::IMREAD_GRAYSCALE);
+		if (leftImage.empty()) { // is input invalid
 			std::cerr <<  "Could not open or find the left image: '" << leftPath << "'" << std::endl;
 			return EXIT_FAILURE;
 		}
 
 		// load right image
-		cv::Mat rightMat = cv::imread(rightPath, cv::IMREAD_GRAYSCALE);
-		if (rightMat.empty()) { // is input invalid
-			std::cerr <<  "Could not open or find the right image: '" << rightMat << "'" << std::endl;
+		cv::Mat rightImage = cv::imread(rightPath, cv::IMREAD_GRAYSCALE);
+		if (rightImage.empty()) { // is input invalid
+			std::cerr << "Could not open or find the right image: '" << rightImage << "'" << std::endl;
 			return EXIT_FAILURE;
 		}
 
@@ -349,7 +395,7 @@ int main(int argc, char ** argv)
 
 		cv::Mat disparity16;
 		// StereoBM compute 16-bit fixed-point disparity map (where each disparity value has 4 fractional bits).
-		stereo->compute(leftMat, rightMat, disparity16);
+		stereo->compute(leftImage, rightImage, disparity16);
 
 		cv::Mat disparity32;
 		disparity16.convertTo(disparity32, CV_32F, 1.f / 16.f);
@@ -361,9 +407,149 @@ int main(int argc, char ** argv)
 		// corner detection
 		//
 
-		std::vector<cv::Point2f> corners;
+		// convert error to color
+		std::vector<cv::Point2f> detectedCorners;
 		// detect corners
-		cv::goodFeaturesToTrack(leftMat, corners, maxCorners, qualityLevel, minDistance, cv::noArray(), blockSize, useHarrisDetector, k);
+		cv::goodFeaturesToTrack(
+				leftImage,
+				detectedCorners,
+				maxCorners,
+				qualityLevel,
+				minDistance,
+				cv::noArray(),
+				cornerBlockSize,
+				useHarrisDetector,
+				k);
+
+		//
+		// depth collection
+		//
+
+		std::vector<float_t> depths;
+		depths.reserve(std::size(detectedCorners));
+
+		for (std::size_t i = 0L; i < std::size(detectedCorners); ++i) {
+			auto && pt = detectedCorners[i];
+
+			auto const col = static_cast<int>(std::round(pt.x));
+			auto const row = static_cast<int>(std::round(pt.y));
+
+			auto depth = depthMap.at<float_t>(row, col);
+			bool valid = 0.f < depth && std::isfinite(depth);
+
+			if (valid) { // only collect valid depths
+				depths.emplace_back(depth);
+			} else { // remove corners without valid depth
+				detectedCorners[i] = detectedCorners.back();
+				detectedCorners.pop_back();
+				--i;
+			}
+		}
+
+		//
+		// "memories"
+		//
+
+		std::vector<cv::Point2f> trackedCorners;
+		if (!prevLeftImage.empty()) {
+
+			std::vector<uchar> status;
+			std::vector<float> errors;
+
+			// track from current to previous image
+			cv::calcOpticalFlowPyrLK(
+					leftImage,
+					prevLeftImage,
+					detectedCorners,
+					trackedCorners,
+					status,
+					errors,
+					windowSize,
+					maxLevel,
+					termCriteria,
+					0,
+					minEigThreshold);
+
+			float const ifx = 1.f / calib.fx;
+			float const ify = 1.f / calib.fy;
+			float const icx = -calib.cx / calib.fx;
+			float const icy = -calib.cy / calib.fy;
+
+			std::vector<cv::Point3f> landmarks;
+			std::vector<cv::Point2f> observations;
+
+			for (std::size_t i = 0L; i < std::size(detectedCorners); ++i) {
+				// this corner could be tracked back
+				if (status[i]) {
+					float const z = depths[i]; // only collected valid depths
+					cv::Point2f const & curr = detectedCorners[i];
+					cv::Point2f const & prev = trackedCorners[i];
+
+					float const cu = curr.x * ifx + icx;
+					float const cv = curr.y * ify + icy;
+					landmarks.emplace_back(cu * z, cv * z, z);
+
+					float const pu = prev.x * ifx + icx;
+					float const pv = prev.y * ify + icy;
+					observations.emplace_back(pu, pv);
+				}
+			}
+
+			// remove not tracked corners
+			filter(status, detectedCorners);
+			filter(status, trackedCorners);
+
+			cv::Matx31d rvec{};
+			cv::Matx31d tvec{};
+			std::vector<int> inliers;
+
+			cv::solvePnPRansac(
+					landmarks,
+					observations,
+					cv::Matx33f::eye(),
+					cv::noArray(),
+					rvec,
+					tvec,
+					false,
+					std::size(observations),
+					0.707f * ifx, // points are also "normalized"
+					0.99,
+					inliers,
+					cv::SOLVEPNP_ITERATIVE);
+
+			// clean up the corners (actually only for visualization)
+			{
+				std::vector<cv::Point2f> detected;
+				std::vector<cv::Point2f> tracked;
+
+				detected.swap(detectedCorners);
+				tracked.swap(trackedCorners);
+
+				detectedCorners.reserve(std::size(inliers));
+				trackedCorners.reserve(std::size(inliers));
+
+				for (auto const idx : inliers) {
+					detectedCorners.emplace_back(detected[idx]);
+					trackedCorners.emplace_back(tracked[idx]);
+				}
+			}
+
+			// convert translation to Eigen
+			Eigen::Vector3d t;
+			cv::cv2eigen(tvec, t);
+
+			// convert rotation to Eigen
+			cv::Matx33d cvR;
+			cv::Rodrigues(rvec, cvR);
+			Eigen::Matrix3d R;
+			cv::cv2eigen(cvR, R);
+
+			// combine translation & rotation
+			Eigen::Affine3d const delta{Eigen::Translation3d(t) * R}; // we track back -> already inverse!
+			Eigen::Affine3d const pose{trajectory.back() * delta};
+
+			trajectory.push_back(pose);
+		}
 
 		//
 		// visualization
@@ -379,27 +565,66 @@ int main(int argc, char ** argv)
 		cv::applyColorMap(disparityScaled, disparityColored, cv::COLORMAP_JET);
 
 		cv::Mat leftColored; // not really, just 3 channels
-		cv::cvtColor(leftMat, leftColored, cv::COLOR_GRAY2BGR);
+		cv::cvtColor(leftImage, leftColored, cv::COLOR_GRAY2BGR);
 
 		// overlay left image and disparity map
 		cv::Mat overlay = leftColored * 0.67f + disparityColored * 0.33f;
 
 		// mark invalid disparities (and zeros, skip infinite depths)
-		cv::Mat mask = (short{0} >= disparity16);
+		cv::Mat const mask = (short{0} >= disparity16);
+
 		// copy the marked pixels from the left image into the result image
 		leftColored.copyTo(overlay, mask);
 
-		// draw all strong corners
-		for (auto && pt : corners) {
-			cv::circle(overlay, pt, 2, cv::Scalar{255, 255, 255}, -1, 8, 0);
-			cv::circle(overlay, pt, 1, cv::Scalar{0, 0, 0}, -1, 8, 0);
+		// draw corners
+		if (!std::empty(trackedCorners)) {
+			std::size_t const size = std::size(detectedCorners);
+
+			for (std::size_t i = 0L; i < size; ++i) {
+				auto const & prev = trackedCorners[i];
+				auto const & curr = detectedCorners[i];
+
+				cv::line(
+						overlay,
+						cv::Point{static_cast<int>(std::round(prev.x)), static_cast<int>(std::round(prev.y))},
+						cv::Point{static_cast<int>(std::round(curr.x)), static_cast<int>(std::round(curr.y))},
+						cv::Scalar{0, 255, 255},
+						1,
+						cv::LINE_8,
+						0);
+
+				cv::circle(overlay, curr, 2, cv::Scalar{255, 255, 255}, -1, cv::LINE_8, 0);
+				cv::circle(overlay, curr, 1, cv::Scalar{0, 0, 0}, -1, cv::LINE_8, 0);
+			}
+		}
+
+		float const scale = 1.f / trajectoryScale;
+		cv::Point2f const pp{calib.cx, calib.cy};
+		Eigen::Affine3d const origin{trajectory.back().inverse()};
+		for (auto && pose : trajectory) {
+			Eigen::Affine3d const transform{origin * pose};
+			Eigen::Vector3f const t = transform.translation().cast<float>();
+			cv::Point2f const pt{-t[0], t[2]};
+			cv::circle(overlay, pp - (pt * scale), 1, cv::Scalar{255, 0, 255}, -1, 8, 0);
 		}
 
 		cv::imshow("result", overlay);
-		auto const key = cv::waitKey(1);
+		auto const key = cv::waitKey(play);
 		if (ESC_KEY == key) { // exit when the Escape key is pressed
-			id = std::numeric_limits<int>::max() - 1;
+			frameIdx = std::numeric_limits<int>::max() - 1;
+		} else if (ESC_SPACE == key) { // toggle pause/play
+			play = !play;
+		} else if (43 == key || 171 == key) { // +
+			trajectoryScale /= 2.f;
+		} else if (45 == key || 173 == key) { // -
+			trajectoryScale *= 2.f;
 		}
+
+		//
+		// "remember"
+		//
+
+		prevLeftImage = std::move(leftImage);
 
 	}
 
