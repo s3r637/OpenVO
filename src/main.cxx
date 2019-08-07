@@ -26,6 +26,9 @@
 namespace fs = boost::filesystem;
 namespace po = boost::program_options;
 
+using Pose = Eigen::Affine3d;
+using Trajectory = std::vector<Pose, Eigen::aligned_allocator<Pose>>;
+
 constexpr int ESC_KEY = 27;
 constexpr int ESC_SPACE = 32;
 
@@ -39,6 +42,9 @@ struct ProgramOptions
 		, mLeftFramesDir{}
 		, mRightFramesDir{}
 		, mCalibrationFile{}
+		, mGroundTruthFile{}
+		, mTrajectoryFile{}
+		, mHeadless{}
 		, mStart{}
 		, mEnd{}
 		, mStep{}
@@ -62,6 +68,19 @@ struct ProgramOptions
 			("calibration,c",
 			 po::value<fs::path>(&mCalibrationFile)->default_value("calib.txt"),
 			 "calibration file")
+
+			("gt",
+			 po::value<fs::path>(&mGroundTruthFile)->default_value(""),
+			 "ground truth file\n"
+			 "([R|t] 3x4-matrix in row major order")
+
+			("trajectory,t",
+			 po::value<fs::path>(&mTrajectoryFile)->implicit_value("ovo_result.txt"),
+			 "output file for the computed trajectory")
+
+			("headless",
+			 po::bool_switch(&mHeadless)->default_value(false),
+			 "run without visualization")
 
 			("start",
 			 po::value<int>(&mStart)->default_value(0),
@@ -91,20 +110,41 @@ struct ProgramOptions
 		// like ("compression", value<int>()->default_value(10), "compression level")
 		po::notify(vm);
 
-		if (not mBaseDir.empty()) {
-			mLeftFramesDir = this->extend(mBaseDir, mLeftFramesDir);
-			mRightFramesDir = this->extend(mBaseDir, mRightFramesDir);
-			mCalibrationFile = this->extend(mBaseDir, mCalibrationFile);
+		if (not std::empty(mBaseDir)) {
+			mLeftFramesDir = fs::canonical(mLeftFramesDir, mBaseDir);
+			mRightFramesDir = fs::canonical(mRightFramesDir, mBaseDir);
+			mCalibrationFile = fs::canonical(mCalibrationFile, mBaseDir);
+
+			if (not std::empty(mGroundTruthFile)) {
+				mGroundTruthFile = fs::canonical(mGroundTruthFile, mBaseDir);
+			}
+
+			if (not std::empty(mTrajectoryFile)) {
+				mTrajectoryFile = this->extend(fs::canonical(mBaseDir), mTrajectoryFile);
+			}
 		}
 
 		if (not fs::is_directory(mLeftFramesDir)) {
 			throw std::invalid_argument("dir given in --left does not exist");
 		}
+
 		if (not fs::is_directory(mRightFramesDir)) {
 			throw std::invalid_argument("dir given in --right does not exist");
 		}
+
 		if (not fs::is_regular_file(mCalibrationFile)) {
 			throw std::invalid_argument("file given in --calibration does not exist");
+		}
+
+		if (not std::empty(mGroundTruthFile) and not fs::is_regular_file(mGroundTruthFile)) {
+			throw std::invalid_argument("file given in --groundtruth does not exist");
+		}
+
+		if (not std::empty(mTrajectoryFile)) {
+			auto parent = mTrajectoryFile.parent_path();
+			if (not fs::exists(parent)) {
+				fs::create_directories(parent);
+			}
 		}
 	}
 
@@ -117,7 +157,7 @@ struct ProgramOptions
 	 */
 	[[nodiscard]] fs::path extend(fs::path const & root, fs::path const & child) const
 	{
-		if (child.is_relative() and not child.empty()) {
+		if (child.is_relative() and not std::empty(child)) {
 			return root / child;
 		}
 		return child;
@@ -127,6 +167,11 @@ struct ProgramOptions
 	fs::path mLeftFramesDir;
 	fs::path mRightFramesDir;
 	fs::path mCalibrationFile;
+	fs::path mGroundTruthFile;
+
+	fs::path mTrajectoryFile;
+
+	bool mHeadless;
 
 	int mStart;
 	int mStep;
@@ -189,7 +234,7 @@ std::vector<std::string> collectFiles(fs::path const & dir) {
  * Loads a whole file in a string.
  *
  * @param file File path.
- * @return The contant of the file.
+ * @return Content of the file.
  */
 std::string loadFileContent(fs::path const & file)
 {
@@ -259,6 +304,81 @@ Calibration loadCalibration(fs::path const & file)
 }
 
 /**
+ * Loads a trajectory from a @a file. The file should be in KITTI format.
+ *
+ * @param file Path to the trajectory file.
+ * @return Trajectory, std::vector of Eigen::Affine3d.
+ */
+Trajectory loadTrajectory(fs::path const & file)
+{
+	auto && numerics = loadNumerics<float_t>(file);
+	std::size_t const size = std::size(numerics);
+	assert(0 == (size % 12));
+	std::size_t const length = std::size(numerics) / 12L; // number of poses
+	Trajectory trajectory;
+	trajectory.reserve(length);
+
+	for (std::size_t i = 0L; i < size; i += 12L) {
+		// KITTI style: transform consists of 3x4 transformation matrix, stored in rows
+
+		auto const m_00 = boost::lexical_cast<double>(numerics.at(i + 0L));
+		auto const m_01 = boost::lexical_cast<double>(numerics.at(i + 1L));
+		auto const m_02 = boost::lexical_cast<double>(numerics.at(i + 2L));
+
+		auto const tx = boost::lexical_cast<double>(numerics.at(i + 3L));
+
+		auto const m_10 = boost::lexical_cast<double>(numerics.at(i + 4L));
+		auto const m_11 = boost::lexical_cast<double>(numerics.at(i + 5L));
+		auto const m_12 = boost::lexical_cast<double>(numerics.at(i + 6L));
+
+		auto const ty = boost::lexical_cast<double>(numerics.at(i + 7L));
+
+		auto const m_20 = boost::lexical_cast<double>(numerics.at(i + 8L));
+		auto const m_21 = boost::lexical_cast<double>(numerics.at(i + 9L));
+		auto const m_22 = boost::lexical_cast<double>(numerics.at(i + 10L));
+
+		auto const tz = boost::lexical_cast<double>(numerics.at(i + 11L));
+
+		Eigen::Translation3d const translation{tx, ty, tz};
+		Eigen::Matrix3d rotation;
+		rotation <<
+			m_00, m_01, m_02,
+			m_10, m_11, m_12,
+			m_20, m_21, m_22;
+
+		Pose const pose{translation * rotation};
+		trajectory.push_back(pose);
+	}
+
+	return trajectory;
+}
+
+/**
+ * Saves a @a trajectory to a @a file in KITTI format.
+ *
+ * @param file Path to the trajectory file.
+ * @param trajectory Trajectory.
+ */
+void saveTrajectory(fs::path const & file, Trajectory const & trajectory)
+{
+	// open stream
+	std::ofstream s{file.string()};
+
+	for (auto && pose : trajectory) {
+		Eigen::Matrix3d r = pose.rotation();
+		Eigen::Vector3d t = pose.translation();
+
+		s <<
+			r(0, 0) << ' ' << r(0, 1) << ' ' << r(0, 2) << ' ' << t.x() << ' ' <<
+			r(1, 0) << ' ' << r(1, 1) << ' ' << r(1, 2) << ' ' << t.y() << ' ' <<
+			r(2, 0) << ' ' << r(2, 1) << ' ' << r(2, 2) << ' ' << t.z() << '\n';
+	}
+
+	s.flush();
+	s.close();
+}
+
+/**
  * Removes all elements from @a v where the value of @a b is 0.
  * Provided for convenience.
  *
@@ -312,6 +432,11 @@ int main(int argc, char ** argv)
 
 	// load the calibration of right camera
 	Calibration calib = loadCalibration(opts->mCalibrationFile);
+	// load the reference trajectory
+	Trajectory groundTruth;
+	if (not std::empty(opts->mGroundTruthFile) and not opts->mHeadless) {
+		groundTruth = loadTrajectory(opts->mGroundTruthFile);
+	}
 
 	//
 	// parameterization
@@ -353,13 +478,15 @@ int main(int argc, char ** argv)
 	stereo->setTextureThreshold(textureThreshold);
 	stereo->setUniquenessRatio(uniquenessRatio);
 
-	cv::namedWindow("result", cv::WINDOW_AUTOSIZE);
+	if (not opts->mHeadless) {
+		cv::namedWindow("result", cv::WINDOW_AUTOSIZE);
+	}
 
 	cv::Mat prevLeftImage;
 
-	std::vector<Eigen::Affine3d, Eigen::aligned_allocator<Eigen::Affine3d>> trajectory;
+	Trajectory trajectory;
 	// first frame
-	trajectory.push_back(Eigen::Affine3d::Identity());
+	trajectory.push_back(Pose::Identity());
 
 	// meter per pixel
 	float trajectoryScale = 1.f;
@@ -390,15 +517,23 @@ int main(int argc, char ** argv)
 		}
 
 		//
-		// disparity & depth map calculation
+		// disparity calculation
 		//
 
 		cv::Mat disparity16;
 		// StereoBM compute 16-bit fixed-point disparity map (where each disparity value has 4 fractional bits).
 		stereo->compute(leftImage, rightImage, disparity16);
 
+		//
+		// disparity conversion (fixed-point to floating-point)
+		//
+
 		cv::Mat disparity32;
 		disparity16.convertTo(disparity32, CV_32F, 1.f / 16.f);
+
+		//
+		// depths computation
+		//
 
 		cv::Mat_<float_t> depthMap(disparity32.size());
 		depthMap = -calib.tx / disparity32;
@@ -495,10 +630,6 @@ int main(int argc, char ** argv)
 				}
 			}
 
-			// remove not tracked corners
-			filter(status, detectedCorners);
-			filter(status, trackedCorners);
-
 			cv::Matx31d rvec{};
 			cv::Matx31d tvec{};
 			std::vector<int> inliers;
@@ -518,7 +649,11 @@ int main(int argc, char ** argv)
 					cv::SOLVEPNP_ITERATIVE);
 
 			// clean up the corners (actually only for visualization)
-			{
+			if (not opts->mHeadless) {
+				// remove not tracked corners
+				filter(status, detectedCorners);
+				filter(status, trackedCorners);
+
 				std::vector<cv::Point2f> detected;
 				std::vector<cv::Point2f> tracked;
 
@@ -528,6 +663,7 @@ int main(int argc, char ** argv)
 				detectedCorners.reserve(std::size(inliers));
 				trackedCorners.reserve(std::size(inliers));
 
+				// keep only inliers
 				for (auto const idx : inliers) {
 					detectedCorners.emplace_back(detected[idx]);
 					trackedCorners.emplace_back(tracked[idx]);
@@ -555,69 +691,82 @@ int main(int argc, char ** argv)
 		// visualization
 		//
 
-		// apply a colormap to the computed disparity for visualization only!
-		cv::Mat disparityColored, disparityScaled;
-		// disparity range: [min valid/used value - max value] -> (0 - 64]
-		// 16-bit fixed-point disparity map with 4 fractional bits -> shift 4 bits or * 16
-		// alpha = 255 / (max - min) -> 0.249 = 255 / (64 * 16 - (1/16) * 16)
-		// fix alpha keeps the colors of depths stable, calculation of min - max changes alpha -> "color flickers"
-		disparity16.convertTo(disparityScaled, CV_8U, 0.249);
-		cv::applyColorMap(disparityScaled, disparityColored, cv::COLORMAP_JET);
+		if (not opts->mHeadless) {
+			// apply a colormap to the computed disparity for visualization only!
+			cv::Mat disparityColored, disparityScaled;
+			// disparity range: [min valid/used value - max value] -> (0 - 64]
+			// 16-bit fixed-point disparity map with 4 fractional bits -> multiplied by 16 ("shift by 4 bits")
+			// alpha = 255 / (max - min) -> 0.249 = 255 / (64 * 16 - (1/16) * 16)
+			// fix alpha keeps the colors of depths stable, calculation of min - max changes alpha -> "color flickers"
+			disparity16.convertTo(disparityScaled, CV_8U, 0.249);
+			cv::applyColorMap(disparityScaled, disparityColored, cv::COLORMAP_JET);
 
-		cv::Mat leftColored; // not really, just 3 channels
-		cv::cvtColor(leftImage, leftColored, cv::COLOR_GRAY2BGR);
+			cv::Mat leftColored; // not really, just 3 channels
+			cv::cvtColor(leftImage, leftColored, cv::COLOR_GRAY2BGR);
 
-		// overlay left image and disparity map
-		cv::Mat overlay = leftColored * 0.67f + disparityColored * 0.33f;
+			// overlay left image and disparity map
+			cv::Mat overlay = leftColored * 0.67f + disparityColored * 0.33f;
 
-		// mark invalid disparities (and zeros, skip infinite depths)
-		cv::Mat const mask = (short{0} >= disparity16);
+			// mark invalid disparities (and zeros, skip infinite depths)
+			cv::Mat const mask = (short{0} >= disparity16);
 
-		// copy the marked pixels from the left image into the result image
-		leftColored.copyTo(overlay, mask);
+			// copy the marked pixels from the left image into the result image
+			leftColored.copyTo(overlay, mask);
 
-		// draw corners
-		if (!std::empty(trackedCorners)) {
-			std::size_t const size = std::size(detectedCorners);
+			// draw corners
+			if (!std::empty(trackedCorners)) {
+				std::size_t const size = std::size(detectedCorners);
 
-			for (std::size_t i = 0L; i < size; ++i) {
-				auto const & prev = trackedCorners[i];
-				auto const & curr = detectedCorners[i];
+				for (std::size_t i = 0L; i < size; ++i) {
+					auto const &prev = trackedCorners[i];
+					auto const &curr = detectedCorners[i];
 
-				cv::line(
-						overlay,
-						cv::Point{static_cast<int>(std::round(prev.x)), static_cast<int>(std::round(prev.y))},
-						cv::Point{static_cast<int>(std::round(curr.x)), static_cast<int>(std::round(curr.y))},
-						cv::Scalar{0, 255, 255},
-						1,
-						cv::LINE_8,
-						0);
+					cv::line(
+							overlay,
+							cv::Point{static_cast<int>(std::round(prev.x)), static_cast<int>(std::round(prev.y))},
+							cv::Point{static_cast<int>(std::round(curr.x)), static_cast<int>(std::round(curr.y))},
+							cv::Scalar{0, 255, 255},
+							1,
+							cv::LINE_8,
+							0);
 
-				cv::circle(overlay, curr, 2, cv::Scalar{255, 255, 255}, -1, cv::LINE_8, 0);
-				cv::circle(overlay, curr, 1, cv::Scalar{0, 0, 0}, -1, cv::LINE_8, 0);
+					cv::circle(overlay, curr, 2, cv::Scalar{255, 255, 255}, -1, cv::LINE_8, 0);
+					cv::circle(overlay, curr, 1, cv::Scalar{0, 0, 0}, -1, cv::LINE_8, 0);
+				}
 			}
-		}
 
-		float const scale = 1.f / trajectoryScale;
-		cv::Point2f const pp{calib.cx, calib.cy};
-		Eigen::Affine3d const origin{trajectory.back().inverse()};
-		for (auto && pose : trajectory) {
-			Eigen::Affine3d const transform{origin * pose};
-			Eigen::Vector3f const t = transform.translation().cast<float>();
-			cv::Point2f const pt{-t[0], t[2]};
-			cv::circle(overlay, pp - (pt * scale), 1, cv::Scalar{255, 0, 255}, -1, 8, 0);
-		}
+			float const scale = 1.f / trajectoryScale;
+			cv::Point2f const pp{calib.cx, calib.cy};
 
-		cv::imshow("result", overlay);
-		auto const key = cv::waitKey(play);
-		if (ESC_KEY == key) { // exit when the Escape key is pressed
-			frameIdx = std::numeric_limits<int>::max() - 1;
-		} else if (ESC_SPACE == key) { // toggle pause/play
-			play = !play;
-		} else if (43 == key || 171 == key) { // +
-			trajectoryScale /= 2.f;
-		} else if (45 == key || 173 == key) { // -
-			trajectoryScale *= 2.f;
+			if (std::size(trajectory) <= std::size(groundTruth)) {
+				Eigen::Affine3d const gtOrigin{groundTruth[std::size(trajectory) - 1L].inverse()};
+				for (auto const &pose : groundTruth) {
+					Eigen::Affine3d const transform{gtOrigin * pose};
+					Eigen::Vector3f const t = transform.translation().cast<float>();
+					cv::Point2f const pt{static_cast<float_t >(-t[0]), static_cast<float_t >(t[2])};
+					cv::circle(overlay, pp - (pt * scale), 1, cv::Scalar{0, 255, 0}, -1, 8, 0);
+				}
+			}
+
+			Eigen::Affine3d const origin{trajectory.back().inverse()};
+			for (auto &&pose : trajectory) {
+				Eigen::Affine3d const transform{origin * pose};
+				Eigen::Vector3f const t = transform.translation().cast<float>();
+				cv::Point2f const pt{-t[0], t[2]};
+				cv::circle(overlay, pp - (pt * scale), 1, cv::Scalar{255, 0, 255}, -1, 8, 0);
+			}
+
+			cv::imshow("result", overlay);
+			auto const key = cv::waitKey(play);
+			if (ESC_KEY == key) { // exit when the Escape key is pressed
+				frameIdx = std::numeric_limits<int>::max() - 1;
+			} else if (ESC_SPACE == key) { // toggle pause/play
+				play = !play;
+			} else if (43 == key || 171 == key) { // +
+				trajectoryScale /= 2.f;
+			} else if (45 == key || 173 == key) { // -
+				trajectoryScale *= 2.f;
+			}
 		}
 
 		//
@@ -626,6 +775,10 @@ int main(int argc, char ** argv)
 
 		prevLeftImage = std::move(leftImage);
 
+	}
+
+	if (not std::empty(opts->mTrajectoryFile)) {
+		saveTrajectory(opts->mTrajectoryFile, trajectory);
 	}
 
 	cv::destroyAllWindows();
